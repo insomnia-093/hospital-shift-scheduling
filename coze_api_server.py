@@ -7,6 +7,7 @@ Coze AI 工作流 HTTP API 服务器
 
 import os
 import json
+import time
 import logging
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -154,44 +155,149 @@ class CozeHTTPHandler(BaseHTTPRequestHandler):
                 parameters=parameters,
             )
 
-            logger.info(f"Coze 工作流响应对象: {workflow}")
+            logger.info(f"Coze 工作流响应对象类型: {type(workflow)}")
+            logger.info(f"Coze 工作流响应摘要: {self.describe_workflow(workflow)}")
+            response = self.extract_workflow_text(workflow)
+            if response:
+                logger.info(f"成功提取工作流文本结果: {response[:200]}")
+                return response
 
-            # 提取响应 - 尝试多种方式
-            response = None
+            response = self.try_poll_workflow_result(workflow)
+            if response:
+                logger.info(f"轮询后提取到工作流文本结果: {response[:200]}")
+                return response
 
-            # 方式 1：data 属性中的 response 字段
-            if hasattr(workflow, 'data') and isinstance(workflow.data, dict):
-                response = workflow.data.get('response')
-                if response:
-                    logger.info(f"从 data.response 提取: {response[:100]}")
-                    return response
-
-            # 方式 2：output 字段
-            if hasattr(workflow, 'output'):
-                response = workflow.output
-                if response:
-                    logger.info(f"从 output 提取: {response[:100]}")
-                    return response
-
-            # 方式 3：直接转字符串
-            if hasattr(workflow, '__dict__'):
-                logger.info(f"Workflow 属性: {workflow.__dict__}")
-                # 查找包含内容的字段
-                for key, value in workflow.__dict__.items():
-                    if value and isinstance(value, (str, dict)):
-                        response = str(value)
-                        if len(response) > 10:  # 有意义的响应
-                            logger.info(f"从 {key} 提取: {response[:100]}")
-                            return response
-
-            # 方式 4：完整对象转字符串
-            response = str(workflow)
-            logger.info(f"Coze 返回响应: {response[:100]}")
-            return response
-
+            raise Exception(f"未能从 Coze 工作流中提取有效文本结果，响应摘要: {self.describe_workflow(workflow)}")
         except Exception as e:
             logger.error(f"调用 Coze 工作流失败: {e}", exc_info=True)
             raise
+
+    def is_coze_execute_link(self, text):
+        if not isinstance(text, str):
+            return False
+        lower = text.strip().lower()
+        return (
+            'coze.cn/work_flow?' in lower or
+            'coze.cn/workflow?' in lower or
+            ('execute_id=' in lower and 'workflow_id=' in lower)
+        )
+
+    def describe_workflow(self, workflow):
+        """输出简化结构，便于定位真实返回字段。"""
+        try:
+            if workflow is None:
+                return 'None'
+            if isinstance(workflow, dict):
+                return f"dict(keys={list(workflow.keys())[:20]})"
+            if isinstance(workflow, (list, tuple)):
+                return f"{type(workflow).__name__}(len={len(workflow)})"
+            if hasattr(workflow, '__dict__'):
+                keys = list(vars(workflow).keys())[:20]
+                return f"{type(workflow).__name__}(attrs={keys})"
+            return f"{type(workflow).__name__}: {str(workflow)[:300]}"
+        except Exception as e:
+            return f"describe_failed: {e}"
+
+    def extract_workflow_text(self, workflow):
+        """尽可能从 workflow 对象中提取真正的文本输出，过滤执行链接。"""
+        visited = set()
+
+        def walk(value, path='root'):
+            value_id = id(value)
+            if value is None or value_id in visited:
+                return None
+            visited.add(value_id)
+
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return None
+                if self.is_coze_execute_link(text):
+                    logger.info(f"忽略执行链接字段: path={path}, value={text[:200]}")
+                    return None
+                if text.startswith('{') or text.startswith('['):
+                    try:
+                        parsed = json.loads(text)
+                        nested = walk(parsed, f'{path}<json>')
+                        if nested:
+                            return nested
+                    except Exception:
+                        pass
+                if len(text) >= 2:
+                    logger.info(f"提取文本字段: path={path}, value={text[:200]}")
+                    return text
+                return None
+
+            if isinstance(value, dict):
+                preferred_keys = [
+                    'output', 'outputs', 'response', 'result', 'text', 'content', 'message',
+                    'answer', 'final_output', 'finalOutput', 'data', 'node_outputs', 'nodeOutputs'
+                ]
+                for key in preferred_keys:
+                    if key in value:
+                        nested = walk(value.get(key), f'{path}.{key}')
+                        if nested:
+                            return nested
+                for key, nested_value in value.items():
+                    nested = walk(nested_value, f'{path}.{key}')
+                    if nested:
+                        return nested
+                return None
+
+            if isinstance(value, (list, tuple, set)):
+                for idx, item in enumerate(value):
+                    nested = walk(item, f'{path}[{idx}]')
+                    if nested:
+                        return nested
+                return None
+
+            if hasattr(value, '__dict__'):
+                return walk(vars(value), f'{path}.__dict__')
+
+            return None
+
+        return walk(workflow)
+
+    def try_poll_workflow_result(self, workflow):
+        """如果 create 返回的是执行信息而非结果，尝试短轮询获取最终文本。"""
+        execute_id = None
+        if hasattr(workflow, 'execute_id'):
+            execute_id = getattr(workflow, 'execute_id', None)
+        elif hasattr(workflow, 'id'):
+            execute_id = getattr(workflow, 'id', None)
+        elif hasattr(workflow, '__dict__'):
+            execute_id = workflow.__dict__.get('execute_id') or workflow.__dict__.get('id')
+
+        if not execute_id:
+            logger.info('未找到 execute_id，跳过轮询')
+            return None
+
+        logger.info(f'检测到 execute_id={execute_id}，开始尝试轮询 Coze 工作流结果')
+        for idx in range(8):
+            try:
+                if hasattr(coze_client.workflows.runs, 'retrieve'):
+                    result = coze_client.workflows.runs.retrieve(
+                        workflow_id=WORKFLOW_ID,
+                        execute_id=execute_id,
+                    )
+                elif hasattr(coze_client.workflows.runs, 'get'):
+                    result = coze_client.workflows.runs.get(
+                        workflow_id=WORKFLOW_ID,
+                        execute_id=execute_id,
+                    )
+                else:
+                    logger.info('当前 Coze SDK 不支持 retrieve/get 轮询接口')
+                    return None
+
+                logger.info(f'第 {idx + 1} 次轮询工作流结果摘要: {self.describe_workflow(result)}')
+                text = self.extract_workflow_text(result)
+                if text:
+                    return text
+            except Exception as poll_error:
+                logger.warning(f'第 {idx + 1} 次轮询工作流结果失败: {poll_error}')
+            time.sleep(1)
+
+        return None
 
     def generate_demo_response(self, user_input):
         """生成演示响应"""

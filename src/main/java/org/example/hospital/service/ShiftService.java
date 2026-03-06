@@ -115,6 +115,14 @@ public class ShiftService {
 
     @Transactional
     public ShiftResponse updateShiftDetails(Long shiftId, UpdateShiftRequest request) {
+        logger.info("管理员更新班次: shiftId={}, departmentId={}, assigneeUserId={}, requiredRole={}, status={}, start={}, end={}",
+                shiftId,
+                request.getDepartmentId(),
+                request.getAssigneeUserId(),
+                request.getRequiredRole(),
+                request.getStatus(),
+                request.getStartTime(),
+                request.getEndTime());
         validateShiftTimes(request.getStartTime(), request.getEndTime());
         Shift shift = shiftRepository.findById(shiftId)
                 .orElseThrow(() -> new IllegalArgumentException("Shift not found"));
@@ -136,6 +144,8 @@ public class ShiftService {
         }
 
         ShiftResponse response = toResponse(shift);
+        logger.info("管理员更新班次成功: shiftId={}, status={}, assigneeUserId={}",
+                response.getId(), response.getStatus(), response.getAssigneeUserId());
         realtimePublisher.publishShiftEvent("SHIFT_UPDATED", response);
         return response;
     }
@@ -234,6 +244,13 @@ public class ShiftService {
                 .filter(Objects::nonNull)
                 .anyMatch(roleType -> roleType == requiredRole);
         if (!hasRole) {
+            logger.warn("班次指派失败: userId={}, fullName={}, requiredRole={}, actualRoles={}",
+                    userAccount.getId(),
+                    userAccount.getFullName(),
+                    requiredRole,
+                    userAccount.getRoles().stream()
+                            .map(role -> role.getName() != null ? role.getName().name() : "NULL")
+                            .collect(Collectors.toList()));
             throw new IllegalArgumentException("User does not have the required role");
         }
     }

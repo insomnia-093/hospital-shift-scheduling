@@ -3,6 +3,8 @@ package org.example.hospital.service;
 import java.time.OffsetDateTime;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
+import jakarta.annotation.PostConstruct;
 import org.example.hospital.dto.ChatMessage;
 import org.example.hospital.dto.CozeRequest;
 import org.example.hospital.dto.CozeResponse;
@@ -11,6 +13,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
@@ -21,9 +24,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * Coze AI 智能体集成服务
  * 调用 Coze API 获取 AI 回复
  */
+
 @Service
 public class CozeAgentService {
     private static final Logger logger = LoggerFactory.getLogger(CozeAgentService.class);
+    private static final String LOCAL_PROXY_PATH = "/api/coze/chat";
+    private static final String WORKFLOW_RUN_PATH = "/v1/workflow/run";
 
     @Value("${coze.api.url:http://localhost:8000}")
     private String cozeApiUrl;
@@ -44,23 +50,45 @@ public class CozeAgentService {
         this.agentChatService = agentChatService;
     }
 
+    @PostConstruct
+    public void logCozeConfig() {
+        logger.info("[COZE_CONFIG] apiUrl={}, apiKeyPresent={}, workflowIdPresent={}, workflowId={}",
+            cozeApiUrl,
+            cozeApiKey != null && !cozeApiKey.trim().isEmpty(),
+            workflowId != null && !workflowId.trim().isEmpty(),
+            workflowId);
+    }
+
     /**
      * 调用 Coze 智能体获取回复
      */
     public CozeResponse chat(CozeRequest request) {
-        if (request == null || request.getContent() == null || request.getContent().trim().isEmpty()) {
+        if (request == null) {
             String errorMsg = "输入内容不能为空";
-            logger.warn(errorMsg);
+            logger.warn("{}: request is null", errorMsg);
+            return new CozeResponse(null, "FAILED", errorMsg);
+        }
+
+        String normalizedInput = request.getNormalizedContent();
+        if (normalizedInput.isEmpty()) {
+            String errorMsg = "输入内容不能为空";
+            logger.warn("{}: content='{}', message='{}'", errorMsg, request.getContent(), request.getMessage());
             return new CozeResponse(null, "FAILED", errorMsg);
         }
 
         try {
             // 调用 Coze 工作流
-            String response = callCozeWorkflow(request.getContent());
+            String response = callCozeWorkflow(normalizedInput);
 
             if (response == null) {
                 String errorMsg = "Coze 工作流返回 null";
                 logger.error(errorMsg);
+                return new CozeResponse(null, "FAILED", errorMsg);
+            }
+
+            if (isCozeExecuteLink(response)) {
+                String errorMsg = "Coze 返回了执行链接而非最终文本，请检查工作流输出字段映射";
+                logger.error("{}，response={}", errorMsg, response);
                 return new CozeResponse(null, "FAILED", errorMsg);
             }
 
@@ -83,6 +111,16 @@ public class CozeAgentService {
             logger.error(errorMsg, e);
             return new CozeResponse(null, "FAILED", errorMsg);
         }
+    }
+
+    private boolean isCozeExecuteLink(String text) {
+        if (text == null) {
+            return false;
+        }
+        String normalized = text.trim().toLowerCase();
+        return normalized.contains("coze.cn/work_flow?")
+            || normalized.contains("coze.cn/workflow?")
+            || (normalized.contains("execute_id=") && normalized.contains("workflow_id="));
     }
 
     /**
@@ -113,37 +151,43 @@ public class CozeAgentService {
      * 通过 HTTP 调用 Coze 工作流
      */
     private String callCozeViaHttp(String input) throws Exception {
-        logger.info("通过 HTTP 调用 Coze: URL={}, WorkflowID={}, 输入={}", cozeApiUrl, workflowId, input);
+        String resolvedUrl = resolveCozeUrl();
+        boolean proxyMode = isProxyMode(resolvedUrl);
+        logger.info("通过 HTTP 调用 Coze: baseUrl={}, resolvedUrl={}, mode={}, workflowId={}, 输入={}",
+            cozeApiUrl,
+            resolvedUrl,
+            proxyMode ? "proxy" : "workflow",
+            workflowId,
+            input);
 
-        // 构建符合 Coze 工作流规范的请求体
         Map<String, Object> payload = new HashMap<>();
-        payload.put("workflow_id", workflowId);
-
-        // 通常工作流的输入参数在 parameters 中，这里假设工作流接受名为 input 的参数
-        Map<String, String> parameters = new HashMap<>();
-        parameters.put("input", input);
-        payload.put("parameters", parameters);
-
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
-        headers.set("Authorization", "Bearer " + cozeApiKey);
+
+        if (proxyMode) {
+            payload.put("input", input);
+            if (workflowId != null && !workflowId.trim().isEmpty()) {
+                payload.put("workflow_id", workflowId);
+            }
+        } else {
+            payload.put("workflow_id", workflowId);
+            Map<String, String> parameters = new HashMap<>();
+            parameters.put("input", input);
+            payload.put("parameters", parameters);
+            headers.setBearerAuth(cozeApiKey);
+        }
 
         HttpEntity<String> request = new HttpEntity<>(
             objectMapper.writeValueAsString(payload),
             headers
         );
 
-        // 如果 cozeApiUrl 只是域名，则补全路径
-        String url = cozeApiUrl.endsWith("/") ? cozeApiUrl : cozeApiUrl + "/";
-        if (!url.contains("/v1/workflow/run")) {
-            url = url + "v1/workflow/run";
-        }
-
-        logger.debug("发送 HTTP 请求到: {}", url);
+        logger.debug("发送 HTTP 请求到: {}, body={}", resolvedUrl, payload);
 
         try {
-            ResponseEntity<String> response = restTemplate.postForEntity(
-                url,
+            ResponseEntity<String> response = restTemplate.exchange(
+                resolvedUrl,
+                HttpMethod.POST,
                 request,
                 String.class
             );
@@ -156,37 +200,77 @@ public class CozeAgentService {
                 throw new RuntimeException(errorMsg);
             }
 
-            // 解析 Coze 工作流响应内容
-            // 假设返回格式为 {"code":0, "data":"{\"output\":\"...\"}"} 或直接返回结果
-            Map<String, Object> result = objectMapper.readValue(response.getBody(), Map.class);
-
-            // Coze 工作流通常返回在 data 字段中，可能是个 JSON 字符串
-            Object dataObj = result.get("data");
-            if (dataObj == null) {
-                // 如果没有 data 字段，尝试直接获取消息
-                dataObj = result.get("msg");
-            }
-
-            String finalResponse = dataObj != null ? dataObj.toString() : "无有效回复内容";
-
-            // 尝试进一步解析 data 字符串中的 output (可选)
-            try {
-                if (finalResponse.startsWith("{")) {
-                    Map<String, Object> dataMap = objectMapper.readValue(finalResponse, Map.class);
-                    if (dataMap.containsKey("output")) {
-                        finalResponse = dataMap.get("output").toString();
-                    }
-                }
-            } catch (Exception e) {
-                // 解析失败就直接用 data 的文本
-            }
-
-            logger.info("Coze HTTP 调用成功");
+            String responseBody = response.getBody();
+            logger.debug("Coze HTTP 原始响应: {}", responseBody);
+            String finalResponse = extractResponseText(responseBody, proxyMode);
+            logger.info("Coze HTTP 调用成功，解析后回复长度: {}", finalResponse.length());
             return finalResponse;
         } catch (Exception e) {
-            logger.error("HTTP 请求异常: {}", e.getMessage(), e);
+            logger.error("HTTP 请求异常: {}, resolvedUrl={}", e.getMessage(), resolvedUrl, e);
             throw e;
         }
+    }
+
+    private String resolveCozeUrl() {
+        String base = Objects.toString(cozeApiUrl, "").trim();
+        if (base.isEmpty()) {
+            return WORKFLOW_RUN_PATH;
+        }
+
+        if (base.contains(LOCAL_PROXY_PATH) || base.contains(WORKFLOW_RUN_PATH)) {
+            return base;
+        }
+
+        String normalized = base.endsWith("/") ? base.substring(0, base.length() - 1) : base;
+        if (normalized.contains("localhost:8000") || normalized.contains("127.0.0.1:8000")) {
+            return normalized + LOCAL_PROXY_PATH;
+        }
+        return normalized + WORKFLOW_RUN_PATH;
+    }
+
+    private boolean isProxyMode(String resolvedUrl) {
+        return resolvedUrl != null && resolvedUrl.contains(LOCAL_PROXY_PATH);
+    }
+
+    private String extractResponseText(String responseBody, boolean proxyMode) throws Exception {
+        if (responseBody == null || responseBody.trim().isEmpty()) {
+            return "无有效回复内容";
+        }
+
+        Map<String, Object> result = objectMapper.readValue(responseBody, Map.class);
+        Object dataObj;
+        if (proxyMode) {
+            dataObj = firstNonNull(result.get("response"), result.get("message"), result.get("data"), result.get("msg"));
+        } else {
+            dataObj = firstNonNull(result.get("data"), result.get("message"), result.get("msg"), result.get("response"));
+        }
+
+        if (dataObj == null) {
+            return responseBody;
+        }
+
+        String finalResponse = dataObj.toString();
+        try {
+            if (finalResponse.startsWith("{")) {
+                Map<String, Object> dataMap = objectMapper.readValue(finalResponse, Map.class);
+                Object nested = firstNonNull(dataMap.get("output"), dataMap.get("response"), dataMap.get("message"), dataMap.get("content"));
+                if (nested != null) {
+                    finalResponse = nested.toString();
+                }
+            }
+        } catch (Exception ignored) {
+            logger.debug("解析 Coze 嵌套响应失败，使用原始 data 文本");
+        }
+        return finalResponse;
+    }
+
+    private Object firstNonNull(Object... values) {
+        for (Object value : values) {
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
     }
 
     /**

@@ -73,7 +73,7 @@
       <button style="width: auto;" @click="resetUserPassword" :disabled="loading">更新密码</button>
     </div>
 
-ji    <div class="card profile-panel">
+    <div class="card profile-panel">
       <h3>科室值班统计（夜班）</h3>
       <div class="text-muted text-sm" style="margin-bottom: 1rem;">按科室统计已指派的夜班人数</div>
       <div style="display: flex; gap: 2rem; align-items: center;">
@@ -159,7 +159,7 @@ ji    <div class="card profile-panel">
 
             <label>状态</label>
             <select v-model="editForm.status">
-              <option value="PENDING">PENDING</option>
+              <option value="OPEN">OPEN</option>
               <option value="ASSIGNED">ASSIGNED</option>
               <option value="COMPLETED">COMPLETED</option>
               <option value="CANCELLED">CANCELLED</option>
@@ -170,6 +170,9 @@ ji    <div class="card profile-panel">
 
             <label>结束时间</label>
             <input v-model="editForm.endTime" type="datetime-local" />
+
+            <label>备注</label>
+            <input v-model="editForm.notes" type="text" placeholder="可选，填写本次调整说明" />
 
             <p v-if="editError" class="form-error">{{ editError }}</p>
           </div>
@@ -212,9 +215,10 @@ const editForm = reactive({
   assigneeUserId: '',
   requiredRole: '',
   shiftType: 'DAY',
-  status: 'PENDING',
+  status: 'OPEN',
   startTime: '',
-  endTime: ''
+  endTime: '',
+  notes: ''
 });
 
 const userInitials = computed(() => {
@@ -255,9 +259,10 @@ const openShiftEditor = (shift) => {
   editForm.assigneeUserId = shift.assigneeUserId ?? '';
   editForm.requiredRole = shift.requiredRole ?? '';
   editForm.shiftType = shift.shiftType || 'DAY';
-  editForm.status = shift.status || 'PENDING';
+  editForm.status = shift.status || 'OPEN';
   editForm.startTime = toLocalInput(shift.startTime);
   editForm.endTime = toLocalInput(shift.endTime);
+  editForm.notes = shift.notes ?? '';
   showShiftModal.value = true;
 };
 
@@ -291,15 +296,16 @@ const submitShiftEdit = async () => {
 
   savingShift.value = true;
   try {
-    emit('update-shift', {
+    await emit('update-shift', {
       id: Number(editForm.id),
       departmentId: Number(editForm.departmentId),
       assigneeUserId: editForm.assigneeUserId ? Number(editForm.assigneeUserId) : null,
       requiredRole: editForm.requiredRole || null,
       shiftType: editForm.shiftType || 'DAY',
-      status: editForm.status || 'PENDING',
+      status: editForm.status || 'OPEN',
       startTime: start,
-      endTime: end
+      endTime: end,
+      notes: editForm.notes?.trim() || null
     });
     closeShiftEditor();
   } catch (e) {

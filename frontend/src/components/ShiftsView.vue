@@ -157,7 +157,7 @@
 
           <label>状态</label>
           <select v-model="editForm.status">
-            <option value="PENDING">PENDING</option>
+            <option value="OPEN">OPEN</option>
             <option value="ASSIGNED">ASSIGNED</option>
             <option value="COMPLETED">COMPLETED</option>
             <option value="CANCELLED">CANCELLED</option>
@@ -169,11 +169,14 @@
           <label>结束时间</label>
           <input v-model="editForm.endTime" type="datetime-local" />
 
+          <label>备注</label>
+          <input v-model="editForm.notes" type="text" placeholder="可选，填写本次调整说明" />
+
           <p v-if="editError" class="form-error">{{ editError }}</p>
         </div>
         <div class="modal-footer">
           <button class="btn-ghost" @click="closeEditModal">取消</button>
-          <button class="btn-primary" @click="submitEdit">保存</button>
+          <button class="btn-primary" :disabled="savingEdit" @click="submitEdit">{{ savingEdit ? '保存中...' : '保存' }}</button>
         </div>
       </div>
     </div>
@@ -198,12 +201,11 @@ const filterDeptId = ref('');
 const filterStatus = ref('');
 const filterShiftType = ref('');
 
-const statusOptions = ['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'];
+const statusOptions = ['OPEN', 'ASSIGNED', 'COMPLETED', 'CANCELLED'];
 const statusLabel = (status) => {
   const map = {
     OPEN: '待指派',
     ASSIGNED: '已指派',
-    IN_PROGRESS: '进行中',
     COMPLETED: '已完成',
     CANCELLED: '已取消',
     PENDING: '待指派'
@@ -270,6 +272,7 @@ const barWidth = (value) => {
 
 // Admin edit modal logic
 const showEditModal = ref(false);
+const savingEdit = ref(false);
 const editError = ref('');
 const editForm = reactive({
   id: null,
@@ -277,9 +280,10 @@ const editForm = reactive({
   assigneeUserId: '',
   requiredRole: '',
   shiftType: 'DAY',
-  status: 'PENDING',
+  status: 'OPEN',
   startTime: '',
-  endTime: ''
+  endTime: '',
+  notes: ''
 });
 
 const toLocalInput = (isoString) => {
@@ -304,18 +308,20 @@ const openEditModal = (shift) => {
   editForm.assigneeUserId = shift.assigneeUserId ?? '';
   editForm.requiredRole = shift.requiredRole ?? '';
   editForm.shiftType = shift.shiftType || 'DAY';
-  editForm.status = shift.status || 'PENDING';
+  editForm.status = shift.status || 'OPEN';
   editForm.startTime = toLocalInput(shift.startTime);
   editForm.endTime = toLocalInput(shift.endTime);
+  editForm.notes = shift.notes ?? '';
   showEditModal.value = true;
 };
 
 const closeEditModal = () => {
   showEditModal.value = false;
+  savingEdit.value = false;
   editError.value = '';
 };
 
-const submitEdit = () => {
+const submitEdit = async () => {
   editError.value = '';
   if (!editForm.id || !editForm.departmentId) {
     editError.value = '请补全班次ID和科室ID';
@@ -328,22 +334,29 @@ const submitEdit = () => {
     return;
   }
 
-  emit('edit-shift', {
-    id: Number(editForm.id),
-    departmentId: Number(editForm.departmentId),
-    assigneeUserId: editForm.assigneeUserId ? Number(editForm.assigneeUserId) : null,
-    requiredRole: editForm.requiredRole || null,
-    shiftType: editForm.shiftType || 'DAY',
-    status: editForm.status || 'PENDING',
-    startTime: start,
-    endTime: end
-  });
-  closeEditModal();
+  savingEdit.value = true;
+  try {
+    await emit('edit-shift', {
+      id: Number(editForm.id),
+      departmentId: Number(editForm.departmentId),
+      assigneeUserId: editForm.assigneeUserId ? Number(editForm.assigneeUserId) : null,
+      requiredRole: editForm.requiredRole || null,
+      shiftType: editForm.shiftType || 'DAY',
+      status: editForm.status || 'OPEN',
+      startTime: start,
+      endTime: end,
+      notes: editForm.notes?.trim() || null
+    });
+    closeEditModal();
+  } catch (e) {
+    editError.value = e?.message || '保存失败';
+  } finally {
+    savingEdit.value = false;
+  }
 };
 </script>
 
 <style scoped>
-/* ...existing code... */
 .btn-edit { border: 1px solid #9a8cff; color: #5b49d6; background: #fff; border-radius: 10px; padding: 6px 10px; cursor: pointer; }
 .modal-mask { position: fixed; inset: 0; background: rgba(27, 21, 63, 0.25); display: flex; align-items: center; justify-content: center; z-index: 60; }
 .modal-panel { width: min(640px, 92vw); background: #fff; border-radius: 16px; box-shadow: 0 20px 60px rgba(66, 44, 160, 0.25); overflow: hidden; }
@@ -355,5 +368,4 @@ const submitEdit = () => {
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px 16px; }
 .btn-ghost { background: #fff; border: 1px solid #cdc5ff; color: #5b49d6; border-radius: 10px; padding: 8px 14px; }
 .btn-primary { background: linear-gradient(135deg, #9b8bff, #7b6dff); border: none; color: #fff; border-radius: 10px; padding: 8px 14px; }
-/* ...existing code... */
 </style>

@@ -156,73 +156,19 @@ const formatDateParam = (input) => {
   return formatDateKey(date);
 };
 
-const calendarDays = computed(() => {
-  const date = calendarMonth.value;
-  const year = date.getFullYear();
-  const month = date.getMonth();
-  const firstDay = new Date(year, month, 1);
-  const startOffset = firstDay.getDay();
+const normalizeChatText = (value) => {
+  const text = (value ?? '').toString().replace(/\r\n/g, '\n').trim();
+  if (!text) return '';
 
-  const startDate = new Date(year, month, 1 - startOffset);
+  return text;
+};
 
-  const map = new Map();
-  const calendarShifts = calendarData.calendarShifts || {};
-  Object.entries(calendarShifts).forEach(([key, items]) => {
-    const filtered = (items || []).filter(item => {
-      if (!calendarFilterDeptId.value) return true;
-      return String(item.departmentId || '') === String(calendarFilterDeptId.value);
-    });
-    if (!filtered.length) return;
-
-    const mapped = filtered.map(item => {
-      const dept = item.departmentName || '科室';
-      const summary = item.summary || '值班';
-      const headcount = item.headcount != null ? `(${item.headcount}人)` : '';
-      return { type: 'calendar', label: `${dept} ${summary}${headcount}`.trim() };
-    });
-    if (mapped.length) {
-      map.set(key, mapped);
-    }
-  });
-
-  const days = [];
-  for (let i = 0; i < 42; i += 1) {
-    const cellDate = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate() + i);
-    const key = formatDateKey(cellDate);
-    days.push({
-      key,
-      dayNumber: cellDate.getDate(),
-      inMonth: cellDate.getMonth() === month,
-      items: map.get(key) || []
-    });
-  }
-  return days;
-});
-
-const piePalette = ['#6366f1', '#38bdf8', '#f59e0b', '#22c55e', '#a855f7', '#f97316'];
-const departmentShiftPie = computed(() => {
-  const map = new Map();
-  (shifts.value || []).filter(s => !!s.assigneeUserId).forEach(s => {
-    const name = s.departmentName || '未知';
-    map.set(name, (map.get(name) || 0) + 1);
-  });
-
-  const items = Array.from(map.entries()).map(([label, value], i) => ({
-    label, value, color: piePalette[i % piePalette.length]
-  }));
-
-  // Conic gradient style
-  let acc = 0;
-  const total = items.reduce((sum, i) => sum + i.value, 0) || 1;
-  const stops = items.map(item => {
-    const start = (acc / total) * 100;
-    acc += item.value;
-    const end = (acc / total) * 100;
-    return `${item.color} ${start}% ${end}%`;
-  });
-
-  return { items, style: { background: `conic-gradient(${stops.join(', ')})` } };
-});
+const normalizeMessageRole = (msg = {}) => {
+  const role = String(msg.role || msg.sender || '').toUpperCase();
+  if (role === 'AGENT' || role === 'ASSISTANT' || role === 'BOT') return 'AGENT';
+  if (role === 'SYSTEM') return 'SYSTEM';
+  return 'USER';
+};
 
 // Actions
 const handleLoginSuccess = (res) => {
@@ -313,21 +259,25 @@ const updateSummary = (shiftList) => {
      .map(([label, value]) => ({ label, value }));
 };
 
-const applyShiftManagement = (shiftManagement) => {
+const applyShiftManagement = (shiftManagement, options = {}) => {
   if (!shiftManagement) return;
 
+  const { preserveShifts = false } = options;
   const shiftList = Array.isArray(shiftManagement.shifts)
     ? shiftManagement.shifts
     : Array.isArray(shiftManagement?.data?.shifts)
       ? shiftManagement.data.shifts
       : [];
 
-  shifts.value = shiftList;
+  if (!preserveShifts && shiftList.length > 0) {
+    shifts.value = shiftList;
+  }
 
-  const computedTotal = shiftList.length;
-  const computedAssigned = shiftList.filter((s) => s?.assigneeUserId != null).length;
+  const baseShiftList = Array.isArray(shifts.value) && shifts.value.length > 0 ? shifts.value : shiftList;
+  const computedTotal = baseShiftList.length;
+  const computedAssigned = baseShiftList.filter((s) => s?.assigneeUserId != null).length;
   const computedPending = Math.max(computedTotal - computedAssigned, 0);
-  const computedNight = shiftList.filter((s) => {
+  const computedNight = baseShiftList.filter((s) => {
     const t = String(s?.startTime || '');
     return t.includes('T16:') || t.includes('T17:') || t.includes('T18:') || t.includes('T19:') ||
       t.includes('T20:') || t.includes('T21:') || t.includes('T22:') || t.includes('T23:');
@@ -365,25 +315,18 @@ const DEMO_MONTH_FALLBACK = '2026-03';
 const loadShifts = async () => {
   loadingData.value = true;
   try {
-    let visualization = null;
+    const realtimeShifts = await api('/shifts').catch(() => []);
+    shifts.value = Array.isArray(realtimeShifts) ? realtimeShifts : [];
+    updateSummary(shifts.value);
+
     const monthParam = formatMonthParam(calendarMonth.value || new Date());
-
     try {
-      visualization = await api(`/analytics/visualization?month=${monthParam}`);
+      const visualization = await api(`/analytics/visualization?month=${monthParam}`);
+      if (visualization) {
+        applyShiftManagement(visualization.shiftManagement || visualization, { preserveShifts: true });
+      }
     } catch (_) {
-      visualization = null;
-    }
-
-    if (visualization) {
-      applyShiftManagement(visualization.shiftManagement || visualization);
-    }
-
-    if (!Array.isArray(shifts.value) || shifts.value.length === 0) {
-      const fallbackShifts = await api('/shifts');
-      shifts.value = Array.isArray(fallbackShifts) ? fallbackShifts : [];
-      updateSummary(shifts.value);
-    } else {
-      updateSummary(shifts.value);
+      // visualization is optional
     }
   } finally {
     loadingData.value = false;
@@ -395,30 +338,25 @@ const loadDashboard = async () => {
   try {
     const monthParam = formatMonthParam(calendarMonth.value || new Date()) || DEMO_MONTH_FALLBACK;
 
-    const [deptRes, taskRes] = await Promise.all([
+    const [deptRes, taskRes, shiftRes] = await Promise.all([
       api('/departments').catch(() => []),
-      api('/agent/tasks/pending').catch(() => [])
+      api('/agent/tasks/pending').catch(() => []),
+      api('/shifts').catch(() => [])
     ]);
 
     departments.value = Array.isArray(deptRes) ? deptRes : [];
     agentTasks.value = Array.isArray(taskRes) ? taskRes : [];
+    shifts.value = Array.isArray(shiftRes) ? shiftRes : [];
+    updateSummary(shifts.value);
 
     try {
       const visualization = await api(`/analytics/visualization?month=${monthParam}`);
       if (visualization?.shiftManagement || visualization?.overviewPanel) {
-        applyShiftManagement(visualization.shiftManagement || visualization);
+        applyShiftManagement(visualization.shiftManagement || visualization, { preserveShifts: true });
         applyOverviewPanel(visualization.overviewPanel || {});
       }
     } catch (_) {
       // visualization is optional, fallback below
-    }
-
-    if (!Array.isArray(shifts.value) || shifts.value.length === 0) {
-      const shiftRes = await api('/shifts').catch(() => []);
-      shifts.value = Array.isArray(shiftRes) ? shiftRes : [];
-      updateSummary(shifts.value);
-    } else {
-      updateSummary(shifts.value);
     }
 
     if (!calendarData.calendarShifts || Object.keys(calendarData.calendarShifts).length === 0) {
@@ -442,21 +380,25 @@ const loadChatHistory = async () => {
     const list = Array.isArray(res) ? res : (Array.isArray(res?.items) ? res.items : []);
     chatMessages.value = list.map((m, idx) => ({
       id: m.id ?? `msg-${idx}`,
-      role: m.role || (m.sender === 'USER' ? 'user' : 'assistant'),
-      content: m.content || m.message || ''
-    }));
+      role: normalizeMessageRole(m),
+      sender: m.sender || m.fullName || m.username || (normalizeMessageRole(m) === 'AGENT' ? '智能体' : '用户'),
+      timestamp: m.timestamp || m.createdAt || null,
+      content: normalizeChatText(m.content || m.message || '')
+    })).filter((m) => m.content);
   } finally {
     loadingAgent.value = false;
   }
 };
 
 const sendChat = async (payload) => {
-  const text = (payload?.message || payload || '').toString().trim();
+  const text = normalizeChatText(payload?.message || payload || '');
   if (!text) return;
 
   chatMessages.value.push({
     id: `local-user-${Date.now()}`,
-    role: 'user',
+    role: 'USER',
+    sender: user.fullName || user.email || '用户',
+    timestamp: new Date().toISOString(),
     content: text
   });
 
@@ -464,21 +406,35 @@ const sendChat = async (payload) => {
   try {
     const res = await api('/agent/coze-chat', {
       method: 'POST',
-      body: JSON.stringify({ message: text }),
+      body: JSON.stringify({ message: text, content: text }),
       headers: { 'Content-Type': 'application/json' }
     });
 
-    const reply = res?.reply || res?.content || res?.message || '已发送，暂无回复内容';
+    const reply = normalizeChatText([
+      res?.reply,
+      res?.content,
+      res?.message,
+      res?.response,
+      res?.data?.reply,
+      res?.data?.content,
+      res?.data?.message,
+      res?.data?.response
+    ].find(v => typeof v === 'string' && v.trim().length > 0) || '已发送，暂无回复内容');
+
     chatMessages.value.push({
       id: `local-bot-${Date.now()}`,
-      role: 'assistant',
+      role: 'AGENT',
+      sender: '智能体',
+      timestamp: new Date().toISOString(),
       content: reply
     });
   } catch (e) {
     chatMessages.value.push({
       id: `local-err-${Date.now()}`,
-      role: 'assistant',
-      content: `发送失败: ${e?.message || '未知错误'}`
+      role: 'SYSTEM',
+      sender: '系统',
+      timestamp: new Date().toISOString(),
+      content: normalizeChatText(`发送失败: ${e?.message || '未知错误'}`)
     });
   } finally {
     loadingAgent.value = false;
@@ -513,28 +469,23 @@ const normalizeShiftPayload = (payload) => ({
   shiftType: payload.shiftType ?? null,
   status: payload.status ?? null,
   startTime: payload.startTime ?? null,
-  endTime: payload.endTime ?? null
+  endTime: payload.endTime ?? null,
+  notes: payload.notes ?? null
 });
 
 const updateShiftDetails = async (payload) => {
-  if (!payload?.id) return;
-  const body = normalizeShiftPayload(payload);
-
-  // Prefer admin endpoint for explicit permissions; fallback to shared endpoint.
-  try {
-    await api(`/admin/shifts/${payload.id}`, {
-      method: 'PUT',
-      body: JSON.stringify(body),
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (_) {
-    await api(`/shifts/${payload.id}`, {
-      method: 'PUT',
-      body: JSON.stringify(body),
-      headers: { 'Content-Type': 'application/json' }
-    });
+  if (!payload?.id) {
+    throw new Error('排班ID缺失');
   }
 
+  const body = normalizeShiftPayload(payload);
+  const updatedShift = await api(`/admin/shifts/${payload.id}`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' }
+  });
+
+  console.log('管理员保存排班成功:', updatedShift);
   await Promise.all([loadShifts(), loadDashboard()]);
 };
 

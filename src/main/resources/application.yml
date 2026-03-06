@@ -19,6 +19,12 @@ spring:
 
 server:
   port: 9090
+coze:
+  api:
+    url: ${COZE_API_URL:http://localhost:8000/api/coze/chat}
+    key: ${COZE_API_KEY:}
+  workflow:
+    id: ${COZE_WORKFLOW_ID:}
 
 security:
   jwt:
